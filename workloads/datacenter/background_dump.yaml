@@ -1,0 +1,15 @@
+# All-to-all rounds while server 0 dumps 10 MB of background data to server 5,
+# offered just before round 1 and with the same deadline as the rounds.
+# Rounds are the only traffic scored for time, so their messages to server 5
+# must not wait behind the dump. With plain FIFO queues round 1 took 24x the
+# ideal; deadlines alone cannot help here, since both carry the same one.
+id: background_dump
+seed: 1
+drain_s: 3
+flows:
+  - {pattern: incast, src: "sender*", dst: "receiver*", exclude_self: true,
+     direction: allreduce, start_s: 1.0, period_s: 1.0, rounds: 8,
+     burst_bytes: 11200, msg_bytes: 1400, deadline_s: 1.5}
+  - {pattern: bulk, src: "sender0", dst: "receiver5", start_s: 0.9,
+     total_bytes: 10000000, msg_bytes: 1400, deadline_s: 1.5, direction: background}
+events: []

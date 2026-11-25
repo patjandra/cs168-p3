@@ -43,6 +43,14 @@ def test_basic_workload_meets_every_requirement(tmp_path):
     assert r["metrics"]["reliability"]["duplicates"] == 0
 
 
+def test_rounds_do_not_wait_behind_background_traffic(tmp_path):
+    r = run(tmp_path, str(WORKLOADS / "background_dump.yaml"))
+    assert r["metrics"]["reliability"]["ratio"] == 1.0
+    assert r["metrics"]["overhead"]["ratio"] <= 1.30
+    slow = [round(x["slowdown"], 2) for x in r["scenario_specific"]["steps"]["rounds"]]
+    assert max(slow) <= 2.5, slow
+
+
 @pytest.mark.parametrize("name", ["loss", "server_failure", "jitter", "slow_uplink",
                                   "rtt_increase", "big_bursts"])
 def test_stress_workload_delivers_everything(tmp_path, name):
