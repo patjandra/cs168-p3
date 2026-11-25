@@ -90,8 +90,9 @@ def drain(sender, sim):
     run_timers(sender, sim, only=P.SEND_TIMER)
 
 
-def msg(msg_id, dst, size=1400):
-    return AppMessage(msg_id=msg_id, dst=dst, size=size, deadline_s=None, offered_s=0.0)
+def msg(msg_id, dst, size=1400, offered_s=0.0, deadline_s=None):
+    return AppMessage(msg_id=msg_id, dst=dst, size=size, deadline_s=deadline_s,
+                      offered_s=offered_s)
 
 
 def sent_dsts(sim):
@@ -210,6 +211,68 @@ def test_oversized_message_is_skipped_not_crashed(tmp_path):
     drain(s, sim)
     assert sent_ids(sim) == [1]
     assert s.oversized == 1
+
+
+# ---- round traffic first ---------------------------------------------------
+
+def offer(sender, ids, dsts, offered_s, deadline_s=None):
+    """Offer one batch: message ids[k] to dsts[k], all at offered_s."""
+    for mid, dst in zip(ids, dsts):
+        sender.on_app_data(msg(mid, dst, offered_s=offered_s, deadline_s=deadline_s))
+
+
+def test_a_batch_for_one_destination_is_background(tmp_path):
+    s, sim = make_sender(tmp_path)
+    offer(s, range(5), ["receiver4"] * 5, offered_s=0.0)                 # a dump
+    offer(s, [10, 11], ["receiver5", "receiver6"], offered_s=0.001)      # a round
+    s._admit()
+    assert sum(len(q) for q in s.background_q.values()) == 5
+    assert sum(len(q) for q in s.round_q.values()) == 2
+
+
+def test_a_round_goes_ahead_of_a_dump_queued_earlier(tmp_path):
+    s, sim = make_sender(tmp_path)
+    offer(s, range(20), ["receiver4"] * 20, offered_s=0.0)              # dump first
+    offer(s, [100, 101, 102], ["receiver4", "receiver5", "receiver6"], offered_s=0.001)
+    drain(s, sim)
+    assert sent_ids(sim)[:3] == [100, 101, 102]
+    assert sorted(sent_ids(sim)) == list(range(20)) + [100, 101, 102]
+
+
+def test_background_gets_one_send_in_every_eight(tmp_path):
+    s, sim = make_sender(tmp_path)
+    offer(s, range(5), ["receiver4"] * 5, offered_s=0.0)                # background
+    dsts = [f"receiver{i}" for i in (5, 6, 7, 8)] * 4
+    offer(s, range(100, 116), dsts, offered_s=0.001)                    # 16 round msgs
+    drain(s, sim)
+    ids = sent_ids(sim)
+    background_at = [k for k, mid in enumerate(ids) if mid < 100]
+    every = P.BACKGROUND_EVERY
+    assert background_at[:2] == [every - 1, 2 * every - 1]   # never starved
+
+
+def test_earliest_deadline_goes_first_within_a_class(tmp_path):
+    s, sim = make_sender(tmp_path)
+    offer(s, [0, 1], ["receiver4", "receiver5"], offered_s=0.0, deadline_s=1.0)
+    offer(s, [2, 3], ["receiver4", "receiver5"], offered_s=0.1, deadline_s=0.5)
+    drain(s, sim)
+    assert sent_ids(sim) == [2, 3, 0, 1]     # due at 0.6 s before due at 1.0 s
+
+
+def test_without_deadlines_the_older_round_goes_first(tmp_path):
+    s, sim = make_sender(tmp_path)
+    offer(s, [2, 3], ["receiver4", "receiver5"], offered_s=0.01)
+    offer(s, [0, 1], ["receiver4", "receiver5"], offered_s=0.0)
+    drain(s, sim)
+    assert sent_ids(sim) == [0, 1, 2, 3]
+
+
+def test_a_message_with_a_deadline_beats_one_without(tmp_path):
+    s, sim = make_sender(tmp_path)
+    offer(s, [0, 1], ["receiver4", "receiver5"], offered_s=0.0)
+    offer(s, [2, 3], ["receiver4", "receiver5"], offered_s=0.5, deadline_s=1.5)
+    drain(s, sim)
+    assert sent_ids(sim) == [2, 3, 0, 1]
 
 
 # ---- pacing ----------------------------------------------------------------

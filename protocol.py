@@ -41,6 +41,9 @@ Run it with `make run SCENARIO=datacenter`.
 
 from __future__ import annotations
 
+import heapq
+import itertools
+import math
 import re
 import struct
 from collections import deque
@@ -226,6 +229,41 @@ REO_WND_MIN_S = 0.002
 REO_WND_MAX_S = 0.020
 
 
+def _urgency(msg) -> tuple[float, float]:
+    """Sort key within a traffic class: earliest absolute deadline, then oldest.
+
+    Messages without a deadline sort after every message that has one,
+    oldest first, so an earlier round still finishes before a later one.
+    Within one all-to-all round every message shares a deadline, so the
+    round-robin order across destinations is unchanged.
+    """
+    deadline = math.inf if msg.deadline_s is None else msg.offered_s + msg.deadline_s
+    return (deadline, msg.offered_s)
+
+
+# ---------------------------------------------------------------------------
+# Round traffic first
+#
+# Only rounds are scored for time: a round ends when its last message lands,
+# and the step metric's ideal leaves other traffic out. So a round message
+# must not wait behind background data queued earlier for the same receiver.
+# Plain FIFO did exactly that: a 10 MB bulk dump ahead of a round made it 24x
+# the ideal. Deadlines cannot tell the two apart when both carry the same one,
+# and late delivery is not scored here anyway.
+#
+# What marks a round is its shape: one sender is offered messages for several
+# destinations at the same instant (incast). Background arrives one message
+# at a time (bulk at a rate, Poisson) or as a pile for one receiver (a dump, a
+# burst). So a batch offered for FANOUT_MIN or more destinations at once is
+# round traffic and goes first. Background still gets one send in every
+# BACKGROUND_EVERY while both wait, so it can never starve: reliability (every
+# message delivered) counts for more than step time.
+# ---------------------------------------------------------------------------
+
+FANOUT_MIN = 2
+BACKGROUND_EVERY = 8
+
+
 class RttEstimator:
     """Smoothed RTT and its variation for one path (RFC 6298)."""
 
@@ -278,7 +316,13 @@ class MySender(Sender):
         self.me = host_index(self.name)
         receivers = [p for p in self.peers if p.startswith("receiver")] or list(self.peers)
         self.order = rotated_order(receivers, self.me)
-        self.queues = {dst: deque() for dst in self.order}
+        # Per class and destination, a heap of (urgency, arrival, msg). Offers
+        # wait in self.incoming until _admit sorts each batch into a class.
+        self.round_q: dict[str, list] = {dst: [] for dst in self.order}
+        self.background_q: dict[str, list] = {dst: [] for dst in self.order}
+        self.incoming: list = []
+        self.arrivals = itertools.count()
+        self.round_sends_in_row = 0
         self.rr = 0   # position in self.order of the next destination to try
 
         self.rate_bps = PACING_RATE_BPS
@@ -312,7 +356,7 @@ class MySender(Sender):
             self.oversized += 1
             self.log("oversized: skipping msg", msg.msg_id, "of", msg.size, "bytes")
             return
-        self.queues[msg.dst].append(msg)
+        self.incoming.append(msg)
         self._wake()
 
     def on_timer(self, name):
@@ -388,19 +432,62 @@ class MySender(Sender):
         self.outstanding[msg.msg_id] = entry
         return entry
 
-    def _next_message(self):
-        """Round robin: (dst, msg) from the next non-empty queue, or None.
+    def _admit(self):
+        """Sort waiting offers into round or background traffic, by batch.
 
-        Destinations marked down are skipped until they answer a probe.
+        The harness offers every message due at one instant in a single burst,
+        before any timer runs, so a batch is complete by the time the pacer
+        calls this. A batch spanning FANOUT_MIN or more destinations is round
+        traffic (see FANOUT_MIN).
         """
+        if not self.incoming:
+            return
+        fanout: dict[float, set] = {}
+        for msg in self.incoming:
+            fanout.setdefault(msg.offered_s, set()).add(msg.dst)
+        for msg in self.incoming:
+            is_round = len(fanout[msg.offered_s]) >= FANOUT_MIN
+            heap = (self.round_q if is_round else self.background_q)[msg.dst]
+            heapq.heappush(heap, (_urgency(msg), next(self.arrivals), msg))
+        self.incoming.clear()
+
+    def _next_message(self):
+        """(dst, msg) for the next message to send, or None.
+
+        Round traffic first, except that background gets one send in every
+        BACKGROUND_EVERY while both wait. Within a class, the destination
+        whose next message is most urgent goes first (see _urgency), and
+        destinations tied on urgency, as every destination is within one
+        all-to-all round, take turns round robin from self.rr. Destinations
+        marked down are skipped until they answer a probe.
+        """
+        self._admit()
+        rounds = self._most_urgent(self.round_q)
+        background = self._most_urgent(self.background_q)
+        if rounds is not None and (background is None
+                                   or self.round_sends_in_row < BACKGROUND_EVERY - 1):
+            self.round_sends_in_row += 1
+            queues, i = self.round_q, rounds
+        elif background is not None:
+            self.round_sends_in_row = 0
+            queues, i = self.background_q, background
+        else:
+            return None
+        self.rr = (i + 1) % len(self.order)
+        dst = self.order[i]
+        return dst, heapq.heappop(queues[dst])[2]
+
+    def _most_urgent(self, queues) -> int | None:
+        """Position in self.order of the destination to serve next, or None."""
         n = len(self.order)
+        best = None   # (urgency, position)
         for step in range(n):
             i = (self.rr + step) % n
-            q = self.queues[self.order[i]]
-            if q and self.order[i] not in self.down:
-                self.rr = (i + 1) % n
-                return self.order[i], q.popleft()
-        return None
+            dst = self.order[i]
+            q = queues[dst]
+            if q and dst not in self.down and (best is None or q[0][0] < best[0]):
+                best = (q[0][0], i)
+        return None if best is None else best[1]
 
     # ---- reliability --------------------------------------------------------
 
