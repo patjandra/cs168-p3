@@ -7,21 +7,14 @@ first. The receiver hands every DATA packet to the application.
 
 Packet format (network byte order):
 
-    DATA = [type: 1 byte = 0][message ID: 4 bytes][payload]
-    ACK  = [type: 1 byte = 1][message ID: 4 bytes]
+    DATA = [type: 1 byte = 0][send number: 1 byte][message ID: 4 bytes][payload]
+    ACK  = [type: 1 byte = 1][send number: 1 byte][message ID: 4 bytes]
 
-The ACK format is defined, but nothing sends one yet.
-
-Where Implementation 2 goes:
-
-    pacing                   MySender._pump: send one packet, then set
-                             SEND_TIMER for the gap
-    outstanding table + RTO  MySender._transmit: record the packet, start its
-                             timer
-    resends first            MySender._next_message: check a resend queue
-                             before the destination queues
-    ACK handling             MySender.on_datagram
-    duplicate check + ACK    MyReceiver.on_datagram
+The send number counts transmissions of one message (1, 2, ...), and an ACK
+echoes the number of the copy it answers. The sender can then time every
+ACK against the exact copy it answers, resends included. Without it, Karn's
+rule must discard every resent message's ACK, and once the path's RTT grows
+past the RTO, every message is resent and no sample is ever valid again.
 
 Notes for Implementation 2:
 
@@ -56,24 +49,28 @@ SCENARIO = "datacenter"
 TYPE_DATA = 0
 TYPE_ACK = 1
 
-HEADER = struct.Struct("!BI")            # type, message ID -> 5 bytes
+HEADER = struct.Struct("!BBI")           # type, send number, message ID -> 6 bytes
 MAX_DATAGRAM = 1472                       # send_datagram's limit
-MAX_PAYLOAD = MAX_DATAGRAM - HEADER.size  # 1467
+MAX_PAYLOAD = MAX_DATAGRAM - HEADER.size  # 1466
+MAX_SEND_NO = 255                         # the send number saturates here
 
 SEND_TIMER = "send"   # fires the round-robin pump
 LOG_SENDS = 20        # log only the first few sends; logs are capped at 5000 lines
 
 
-def encode_data(msg_id: int, payload: bytes) -> bytes:
-    return HEADER.pack(TYPE_DATA, msg_id) + payload
+def encode_data(msg_id: int, payload: bytes, send_no: int = 1) -> bytes:
+    """DATA for one copy of a message; send_no 1 is its first transmission."""
+    return HEADER.pack(TYPE_DATA, min(send_no, MAX_SEND_NO), msg_id) + payload
 
 
-def encode_ack(msg_id: int) -> bytes:
-    return HEADER.pack(TYPE_ACK, msg_id)
+def encode_ack(msg_id: int, send_no: int) -> bytes:
+    """ACK one copy of a message; send_no is echoed from that copy's DATA."""
+    return HEADER.pack(TYPE_ACK, send_no, msg_id)
 
 
 class Packet(NamedTuple):
     kind: int
+    send_no: int     # which transmission of the message (1 = first)
     msg_id: int
     payload: bytes
 
@@ -82,11 +79,11 @@ def decode(data: bytes) -> Packet | None:
     """Return the packet, or None for one we don't understand."""
     if len(data) < HEADER.size:
         return None
-    kind, msg_id = HEADER.unpack_from(data)
+    kind, send_no, msg_id = HEADER.unpack_from(data)
     if kind == TYPE_DATA:
-        return Packet(kind, msg_id, bytes(data[HEADER.size:]))
+        return Packet(kind, send_no, msg_id, bytes(data[HEADER.size:]))
     if kind == TYPE_ACK and len(data) == HEADER.size:
-        return Packet(kind, msg_id, b"")
+        return Packet(kind, send_no, msg_id, b"")
     return None
 
 
@@ -185,18 +182,27 @@ class MySender(Sender):
 class MyReceiver(Receiver):
     def on_start(self):
         self.malformed = 0
+        self.duplicates = 0
 
     def on_datagram(self, data, addr):
         pkt = decode(data)
         if pkt is None:
             self.malformed += 1
             return
-        if pkt.kind == TYPE_DATA:
-            # Implementation 2 adds the duplicate check and the ACK back to addr.
+        if pkt.kind != TYPE_DATA:
+            return
+        if self.delivered(pkt.msg_id):
+            self.duplicates += 1   # a resend whose first copy got through
+        else:
             self.deliver(pkt.msg_id, pkt.payload)
+        # ACK only what we hold, so a bad copy is resent. A duplicate is ACKed
+        # again because it means our first ACK may have been lost. The echoed
+        # send number lets the sender time this exact copy.
+        if self.delivered(pkt.msg_id):
+            self.send_datagram(encode_ack(pkt.msg_id, pkt.send_no), to=addr)
 
     def on_stop(self):
-        self.log("malformed", self.malformed)
+        self.log("malformed", self.malformed, "duplicates", self.duplicates)
 
 
 SENDER, RECEIVER = MySender, MyReceiver

@@ -83,24 +83,28 @@ def sent_dsts(sim):
 
 # ---- packet format ---------------------------------------------------------
 
-def test_header_is_five_bytes():
-    assert P.HEADER.size == 5
-    assert P.MAX_PAYLOAD == 1467
+def test_header_is_six_bytes():
+    assert P.HEADER.size == 6
+    assert P.MAX_PAYLOAD == 1466
 
 
 @pytest.mark.parametrize("payload", [b"", b"x" * 1400, b"y" * P.MAX_PAYLOAD])
 def test_data_round_trips(payload):
-    pkt = P.encode_data(123456, payload)
-    assert len(pkt) == 5 + len(payload) <= P.MAX_DATAGRAM
-    assert P.decode(pkt) == (P.TYPE_DATA, 123456, payload)
+    pkt = P.encode_data(123456, payload, send_no=3)
+    assert len(pkt) == 6 + len(payload) <= P.MAX_DATAGRAM
+    assert P.decode(pkt) == (P.TYPE_DATA, 3, 123456, payload)
 
 
 def test_ack_round_trips():
-    assert P.decode(P.encode_ack(2**32 - 1)) == (P.TYPE_ACK, 2**32 - 1, b"")
+    assert P.decode(P.encode_ack(2**32 - 1, 7)) == (P.TYPE_ACK, 7, 2**32 - 1, b"")
 
 
-@pytest.mark.parametrize("junk", [b"", b"\x00\x00\x00\x01", b"\x07\x00\x00\x00\x01",
-                                  P.encode_ack(5) + b"extra"])
+def test_send_number_saturates_instead_of_overflowing():
+    assert P.decode(P.encode_data(1, b"", send_no=1000)).send_no == P.MAX_SEND_NO
+
+
+@pytest.mark.parametrize("junk", [b"", b"\x00\x01\x00\x00\x01", b"\x07\x01\x00\x00\x00\x01",
+                                  P.encode_ack(5, 1) + b"extra"])
 def test_decode_rejects_junk(junk):
     assert P.decode(junk) is None
 
@@ -184,19 +188,30 @@ def test_oversized_message_is_skipped_not_crashed(tmp_path):
 
 # ---- receiver --------------------------------------------------------------
 
-def test_receiver_delivers_data_and_sends_nothing_back(tmp_path):
+def test_receiver_delivers_once_and_acks_every_copy(tmp_path):
     m = msg(42, "receiver0", size=100)
     r, sim = make_receiver(tmp_path, [m])
-    r.on_datagram(P.encode_data(42, m.payload), addr_of(3))
+    pkt = P.encode_data(42, m.payload, send_no=2)
+    r.on_datagram(pkt, addr_of(3))
+    r.on_datagram(pkt, addr_of(3))   # a resend: the first ACK may have been lost
     assert r.delivered(42)
-    assert sim.sent == []   # ACKs come in Implementation 2
+    assert r.duplicates == 1
+    assert sim.sent == [(P.encode_ack(42, 2), addr_of(3))] * 2   # echoes the copy
+
+
+def test_receiver_does_not_ack_a_bad_payload(tmp_path):
+    m = msg(7, "receiver0", size=100)
+    r, sim = make_receiver(tmp_path, [m])
+    r.on_datagram(P.encode_data(7, b"wrong bytes"), addr_of(3))
+    assert not r.delivered(7)
+    assert sim.sent == []   # no ACK, so the sender resends it
 
 
 def test_receiver_ignores_junk(tmp_path):
     m = msg(1, "receiver0", size=100)
     r, sim = make_receiver(tmp_path, [m])
     r.on_datagram(b"\x00\x00", addr_of(3))
-    r.on_datagram(P.encode_ack(1), addr_of(3))
+    r.on_datagram(P.encode_ack(1, 1), addr_of(3))
     assert r.malformed == 1
     assert not r.delivered(1)
     assert sim.sent == []
