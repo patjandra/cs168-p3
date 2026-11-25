@@ -59,3 +59,22 @@ def test_stress_workload_delivers_everything(tmp_path, name):
     assert rel["ratio"] == 1.0, rel
     assert rel["corrupt"] == 0
     assert r["metrics"]["overhead"]["ratio"] <= 1.30
+
+
+def test_the_pacer_keeps_up_with_sustained_load(tmp_path):
+    # Rounds offered just under the uplink share must not back up: every
+    # round, not just the mean, stays within the limit.
+    r = run(tmp_path, str(WORKLOADS / "sustained_load.yaml"))
+    assert r["metrics"]["reliability"]["ratio"] == 1.0
+    assert r["metrics"]["overhead"]["ratio"] <= 1.30
+    slow = [round(x["slowdown"], 2) for x in r["scenario_specific"]["steps"]["rounds"]]
+    assert max(slow) <= 2.5, slow
+
+
+def test_the_pacer_backs_off_an_overloaded_link(tmp_path):
+    # The round right after the cut overloads before any feedback arrives, so
+    # this checks what is scored: the mean over rounds.
+    r = run(tmp_path, str(WORKLOADS / "uplinks_cut.yaml"))
+    assert r["metrics"]["reliability"]["ratio"] == 1.0
+    assert r["metrics"]["overhead"]["ratio"] <= 1.30
+    assert r["scenario_specific"]["steps"]["slowdown"]["mean"] <= 2.5
