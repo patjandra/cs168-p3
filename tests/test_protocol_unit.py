@@ -312,6 +312,87 @@ def test_data_after_an_idle_gap_goes_out_at_once(tmp_path):
     assert sim.send_times[1] == pytest.approx(3 * gap_s(1406))
 
 
+# ---- dynamic pacing --------------------------------------------------------
+
+def close_window(sender, sends, losses, at):
+    """Pretend a rate window saw `sends` packets and `losses` losses, then ends."""
+    sender.window_sends, sender.window_losses = sends, losses
+    sender.window_end = at
+    sender._update_rate(at)
+
+
+def test_the_rate_starts_at_the_uplink_share(tmp_path):
+    s, _ = make_sender(tmp_path)
+    assert s.rate_bps == P.PACING_RATE_BPS
+    assert 3 * (6 / 8) * P.PACING_RATE_BPS <= 150e6 < 3 * (6 / 8) * 90e6
+
+
+def test_heavy_loss_in_a_window_cuts_the_rate(tmp_path):
+    s, _ = make_sender(tmp_path)
+    close_window(s, sends=100, losses=40, at=1.0)          # 40%: an overloaded link
+    assert s.rate_bps == pytest.approx(P.OVERLOAD_CUT * P.PACING_RATE_BPS)
+
+
+def test_random_loss_does_not_cut_the_rate(tmp_path):
+    s, _ = make_sender(tmp_path)
+    close_window(s, sends=100, losses=12, at=1.0)          # 12%: 5% link loss
+    assert s.rate_bps == P.PACING_RATE_BPS
+
+
+def test_the_rate_recovers_a_fifth_of_the_gap_per_window(tmp_path):
+    s, _ = make_sender(tmp_path)
+    close_window(s, sends=100, losses=90, at=1.0)
+    cut = s.rate_bps
+    close_window(s, sends=100, losses=0, at=1.1)
+    gap = P.PACING_RATE_BPS - cut
+    assert s.rate_bps == pytest.approx(cut + P.RECOVER_FRACTION * gap)
+    for k in range(40):
+        close_window(s, sends=100, losses=0, at=1.2 + k * 0.1)
+    assert P.PACING_RATE_BPS - 1e4 < s.rate_bps <= P.PACING_RATE_BPS   # within 0.02%
+
+
+def test_the_rate_never_falls_below_the_floor(tmp_path):
+    s, _ = make_sender(tmp_path)
+    for k in range(50):
+        close_window(s, sends=10, losses=10, at=1.0 + k * 0.1)   # a dead link
+    assert s.rate_bps == P.PACING_MIN_BPS
+
+
+def test_a_window_only_closes_after_it_has_run(tmp_path):
+    s, _ = make_sender(tmp_path)
+    s.window_sends, s.window_losses, s.window_end = 10, 10, 1.0
+    s._update_rate(0.99)                                    # not over yet
+    assert s.rate_bps == P.PACING_RATE_BPS
+    s._update_rate(1.0)
+    assert s.rate_bps < P.PACING_RATE_BPS
+
+
+def test_timeouts_and_early_resends_count_as_losses(tmp_path):
+    s, sim = make_sender(tmp_path)
+    send_at(s, sim, 0, "receiver4", 0.000)
+    send_at(s, sim, 1, "receiver4", 0.005)
+    s.window_losses = 0
+    ack(s, sim, 1, at=0.105)                 # 0 is resent early (RACK)
+    assert s.window_losses == 1
+    sim.t = 0.5
+    s.on_app_data(msg(2, "receiver4"))
+    drain(s, sim)
+    s.window_losses = 0
+    run_timers(s, sim, until=sim.t + P.RTO_INITIAL_S + 0.2, only=P.RTO_PREFIX)
+    assert s.window_losses >= 1              # and timeouts count too
+
+
+def test_sends_slow_down_after_a_cut(tmp_path):
+    s, sim = make_sender(tmp_path)
+    s.window_end = 1e9                        # hold the rate where we set it
+    s.rate_bps = P.OVERLOAD_CUT * P.PACING_RATE_BPS
+    for mid in range(3):
+        s.on_app_data(msg(mid, f"receiver{mid + 4}"))
+    drain(s, sim)
+    gaps = [b - a for a, b in zip(sim.send_times, sim.send_times[1:])]
+    assert gaps == pytest.approx([gap_s(6 + 1400) / P.OVERLOAD_CUT] * 2)
+
+
 # ---- reliability -----------------------------------------------------------
 
 def ack(sender, sim, msg_id, at, send_no=1, dst=0):

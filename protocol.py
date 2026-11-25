@@ -141,18 +141,47 @@ WIRE_HEADER_BYTES = 28   # IPv4 + UDP, counted on the wire for every datagram
 # sending rate r the uplink carries 3 * (6/8) * r. That fits while
 # r <= 150 / 2.25 = 66.7 Mbps. The spine-to-rack links are symmetric, and a
 # receiver's 100 Mbps link carries 8 * (r/8) = r, so 66.7 Mbps is the binding
-# share. Pacing under it leaves the 64-packet switch queues room for the
-# moments when all three senders in a rack aim off-rack at once, and for a
-# link that slows down.
+# share. We pace just under it.
 #
-# Tuned in testing (tools/run_suite.py, seeds 1-4): 90 Mbps overflows the
-# uplinks on 24-packet bursts (3.0x slowdown); 60-75 Mbps finish them in
-# 1.01-1.05x but lose packets when an uplink drops to 75 Mbps (2.0x). 55 Mbps
-# (82% of the share) costs 1.09x on big bursts and loses nothing on the slow
-# uplink (1.02x).
+# Why not lower: rounds that keep coming faster than the pacer can send pile
+# up with no loss at all. At 55 Mbps (82% of the share), rounds offered at
+# 61 Mbps backed up to 3.0x by round 100; at 66 Mbps they stay at 1.01x. Big
+# bursts also finish at 1.01x instead of 1.09x.
+# Why not higher: 90 Mbps overflows the uplinks on 24-packet bursts (3.0x).
+# Sitting at the share leaves no headroom when a link slows down, so the rate
+# backs off from overload (below); without that, all uplinks cut to 40 Mbps
+# went from 1.95x at 55 Mbps to 2.62x at 66.
 # ---------------------------------------------------------------------------
 
-PACING_RATE_BPS = 55e6
+PACING_RATE_BPS = 66e6   # also the ceiling the rate recovers to
+
+# ---------------------------------------------------------------------------
+# Dynamic pacing: backing off from overload
+#
+# A link we overload does not lose a few packets, it loses most of them: 66
+# Mbps from each of three senders into uplinks cut to 40 Mbps drops about 70%.
+# Random loss on this network stays far lower (about 12% of messages even at
+# 5% link loss), and so do the needless resends jitter causes. So every
+# RATE_WINDOW_S, if at least OVERLOAD_LOSS_FRACTION of the packets sent were
+# lost (timeouts plus RACK), the rate is cut to OVERLOAD_CUT of itself, never
+# below PACING_MIN_BPS. Otherwise it closes RECOVER_FRACTION of its gap to
+# PACING_RATE_BPS, so a link that comes back is used again within a few
+# windows (a slower linear climb left a recovered server at 1.41x vs 1.16x).
+#
+# Why not delay-based control, as the design doc first planned: it was built
+# and tested, and it did not pay. Switch queues hold 64 packets (about 5 ms)
+# while feedback takes a 100 ms RTT, so a round's 13 ms burst is over, or the
+# queue already overflowed, before the delay shows; jitter and random loss
+# then triggered needless cuts (2% loss 4.29x -> 4.84x, 20 ms delay jitter
+# 1.58x -> 2.02x). Against fixed 66 Mbps, this version cut uplinks at 40 Mbps
+# from 2.62x to 1.92x and uplinks at 75 Mbps from 2.20x to 1.20x.
+# ---------------------------------------------------------------------------
+
+RATE_WINDOW_S = 0.025
+OVERLOAD_LOSS_FRACTION = 0.4
+OVERLOAD_CUT = 0.7
+RECOVER_FRACTION = 0.2
+PACING_MIN_BPS = 10e6
 
 # ---------------------------------------------------------------------------
 # Retransmission timeout (RFC 6298 smoothing, one estimator per destination)
@@ -326,6 +355,9 @@ class MySender(Sender):
         self.rr = 0   # position in self.order of the next destination to try
 
         self.rate_bps = PACING_RATE_BPS
+        self.window_sends = 0            # dynamic pacing (see RATE_WINDOW_S)
+        self.window_losses = 0
+        self.window_end = 0.0
         self.next_send_at = 0.0          # pacing: no send before this time
         self.outstanding: dict[int, Outstanding] = {}   # msg_id -> unACKed packet
         self.resend: deque[int] = deque()               # timed-out msg_ids
@@ -503,9 +535,22 @@ class MySender(Sender):
             self.resent += 1
         self.set_timer(RTO_PREFIX + str(entry.msg_id), self._timeout_for(entry))
         wire_bits = 8 * (len(packet) + WIRE_HEADER_BYTES)
+        self.window_sends += 1
+        self._update_rate(now)
         self.next_send_at = now + wire_bits / self.rate_bps
         if self.data_sent <= LOG_SENDS:
             self.log("send", entry.dst, entry.msg_id)
+
+    def _update_rate(self, now: float):
+        """Close the rate window once it has run: cut on overload, else recover."""
+        if now < self.window_end:
+            return
+        if self.window_sends and self.window_losses / self.window_sends >= OVERLOAD_LOSS_FRACTION:
+            self.rate_bps = max(PACING_MIN_BPS, self.rate_bps * OVERLOAD_CUT)
+        else:
+            self.rate_bps += RECOVER_FRACTION * (PACING_RATE_BPS - self.rate_bps)
+        self.window_sends = self.window_losses = 0
+        self.window_end = now + RATE_WINDOW_S
 
     def _timeout_for(self, entry: Outstanding) -> float:
         """The path's RTO; doubled per send past BACKOFF_AFTER_SENDS, capped.
@@ -526,6 +571,7 @@ class MySender(Sender):
             return   # ACKed in the same instant the timer fired
         dst = entry.dst
         self.timeouts += 1
+        self.window_losses += 1
         if self.timeouts <= LOG_TIMEOUTS:
             self.log("timeout", dst, msg_id, "sends", entry.sends)
         self.timeouts_in_row[dst] += 1
@@ -555,6 +601,7 @@ class MySender(Sender):
             entry.awaiting_resend = True
             entry.early_resend_no = entry.sends + 1
             self.early_resends += 1
+            self.window_losses += 1
             self.resend.append(msg_id)
             found = True
         if found:
