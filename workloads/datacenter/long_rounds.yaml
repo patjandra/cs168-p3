@@ -1,0 +1,9 @@
+# Ten rounds at basic size, back to back: does anything drift or leak
+# between rounds? A clean network, so every target should be met.
+id: long_rounds
+seed: 1
+drain_s: 3
+flows:
+  - {pattern: incast, src: "sender*", dst: "receiver*", exclude_self: true,
+     direction: allreduce, start_s: 1.0, period_s: 1.0, rounds: 10,
+     burst_bytes: 5600, msg_bytes: 1400, deadline_s: 1.5}

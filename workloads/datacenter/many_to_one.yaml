@@ -1,0 +1,9 @@
+# Every server sends 24 packets to server 0 at once: one receiver's links
+# take all the load.
+id: many_to_one
+seed: 1
+drain_s: 3
+flows:
+  - {pattern: incast, src: "sender*", dst: "receiver0", exclude_self: true,
+     direction: allreduce, start_s: 1.0, period_s: 1.5, rounds: 3,
+     burst_bytes: 33600, msg_bytes: 1400, deadline_s: 1.5}

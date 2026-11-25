@@ -1,0 +1,15 @@
+# Every rack uplink's delay goes from 5 to 30 ms for good after round 1, so
+# the cross-rack RTT doubles from 100 to 200 ms, past the RTO the sender has
+# learned. The RTT estimate has to follow it; if it freezes, every message
+# is sent twice and overhead passes 1.6.
+id: rtt_increase
+seed: 1
+drain_s: 3
+flows:
+  - {pattern: incast, src: "sender*", dst: "receiver*", exclude_self: true,
+     direction: allreduce, start_s: 1.0, period_s: 1.0, rounds: 8,
+     burst_bytes: 11200, msg_bytes: 1400, deadline_s: 1.5}
+events:
+  - {t_s: 2.5, kind: delay_change, target: "rack0-spine", delay_ms: 30}
+  - {t_s: 2.5, kind: delay_change, target: "rack1-spine", delay_ms: 30}
+  - {t_s: 2.5, kind: delay_change, target: "rack2-spine", delay_ms: 30}

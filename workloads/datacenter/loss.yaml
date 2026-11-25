@@ -1,0 +1,13 @@
+# 2% random loss on every rack uplink, both ways, so DATA and ACKs both get
+# lost. Every lost message has to be found by its timeout and resent.
+id: loss
+seed: 1
+drain_s: 3
+flows:
+  - {pattern: incast, src: "sender*", dst: "receiver*", exclude_self: true,
+     direction: allreduce, start_s: 1.0, period_s: 1.0, rounds: 8,
+     burst_bytes: 11200, msg_bytes: 1400, deadline_s: 1.5}
+events:
+  - {t_s: 0.5, kind: loss_burst, target: "rack0-spine", loss_pct: 2}
+  - {t_s: 0.5, kind: loss_burst, target: "rack1-spine", loss_pct: 2}
+  - {t_s: 0.5, kind: loss_burst, target: "rack2-spine", loss_pct: 2}

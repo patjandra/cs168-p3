@@ -1,0 +1,9 @@
+# 2,000-byte messages: bigger than one datagram. KNOWN GAP: the protocol has
+# no fragmentation yet and skips these, so expect 0% delivered.
+id: big_messages
+seed: 1
+drain_s: 3
+flows:
+  - {pattern: incast, src: "sender*", dst: "receiver*", exclude_self: true,
+     direction: allreduce, start_s: 1.0, period_s: 1.0, rounds: 2,
+     burst_bytes: 8000, msg_bytes: 2000, deadline_s: 1.5}

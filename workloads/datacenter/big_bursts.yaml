@@ -1,0 +1,9 @@
+# 24 packets per pair per round (5,184 messages over 3 rounds). Without
+# pacing the rack uplinks overflow; this is the main test of the pacing rate.
+id: big_bursts
+seed: 1
+drain_s: 3
+flows:
+  - {pattern: incast, src: "sender*", dst: "receiver*", exclude_self: true,
+     direction: allreduce, start_s: 1.0, period_s: 2.0, rounds: 3,
+     burst_bytes: 33600, msg_bytes: 1400, deadline_s: 1.5}
