@@ -449,6 +449,14 @@ def test_rto_starts_at_the_initial_value():
     assert P.RttEstimator().rto() == P.RTO_INITIAL_S
 
 
+def test_initial_rto_clears_the_base_rtt_but_not_by_much():
+    # Above the 100 ms cross-rack RTT plus the queueing margin, so the first
+    # round sees no needless resends; under two RTTs, so a first-round loss is
+    # not penalised twice as hard as a later one.
+    cross_rack_rtt = 0.100
+    assert cross_rack_rtt + P.RTO_MARGIN_S < P.RTO_INITIAL_S < 2 * cross_rack_rtt
+
+
 def test_first_sample_follows_rfc_6298():
     est = P.RttEstimator()
     est.update(0.1)

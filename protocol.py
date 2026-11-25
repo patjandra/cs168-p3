@@ -159,8 +159,15 @@ PACING_RATE_BPS = 55e6
 # right on top of the RTT. A full 64-packet queue adds up to about 7 ms per
 # hop, and a cross-rack packet crosses three queued hops, so the RTO never
 # sits less than RTO_MARGIN_S (20 ms) above the smoothed RTT. A sudden queue
-# then delays an ACK rather than triggering a resend. Before the first
-# sample, RTO_INITIAL_S is three cross-rack RTTs.
+# then delays an ACK rather than triggering a resend.
+#
+# Before a path's first sample, RTO_INITIAL_S is 1.5 cross-rack RTTs: above
+# the 80-100 ms base RTT plus any queueing, but low enough that a loss in
+# the first round does not wait twice as long as one later on. RFC 6298's
+# 1 s (and our earlier 300 ms) is for networks whose RTT is unknown; this
+# one's is fixed by the topology. At 300 ms the first round of a lossy run
+# took 8.0x the ideal against about 3.0x for the rest; 150 ms cut 0.5-1%
+# uplink loss from 3.6x to 3.3x mean, with no extra resends on clean runs.
 #
 # Backoff: one timeout is almost always a single random loss, and waiting
 # longer for that resend only stretches the round. Two timeouts in a row on
@@ -186,7 +193,7 @@ PACING_RATE_BPS = 55e6
 RTT_ALPHA = 1 / 8
 RTT_BETA = 1 / 4
 RTT_K = 4
-RTO_INITIAL_S = 0.300
+RTO_INITIAL_S = 0.150
 RTO_MARGIN_S = 0.020
 BACKOFF_AFTER_SENDS = 2   # sends at the base RTO before doubling starts
 RTO_MIN_S = 0.050
