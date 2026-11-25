@@ -204,6 +204,27 @@ PROBE_MAX_S = 0.25
 RTO_PREFIX = "rto:"   # "rto:<msg_id>" fires that message's timeout
 LOG_TIMEOUTS = 50     # log only the first few timeouts
 
+# ---------------------------------------------------------------------------
+# Loss detection from ACKs (RACK, RFC 8985)
+#
+# A lost packet otherwise waits out its whole RTO (about 120 ms) before it is
+# resent. But packets to one destination share one FIFO path, so once a later
+# packet to that destination is ACKed, an earlier unACKed one is lost unless
+# the network reordered them. A packet sent at least the reordering window
+# before an ACKed one is therefore resent straight away, about one RTT after
+# it left instead of one RTO. Packets to a destination leave about 1.7 ms
+# apart during a round, so the loss shows up within a packet or two.
+#
+# Only per-packet delay jitter reorders packets here. The send number echoed
+# in each ACK shows when an early resend was needless (the first copy is the
+# one ACKed), and that destination's window then doubles, up to
+# REO_WND_MAX_S. A loss with no later packet behind it (the last one to a
+# destination in a round) still waits for its RTO.
+# ---------------------------------------------------------------------------
+
+REO_WND_MIN_S = 0.002
+REO_WND_MAX_S = 0.020
+
 
 class RttEstimator:
     """Smoothed RTT and its variation for one path (RFC 6298)."""
@@ -234,6 +255,8 @@ class Outstanding:
     dst: str
     payload: bytes     # read once: msg.payload is rebuilt from SHA-256 on every read
     send_times: list[float] = field(default_factory=list)   # [n-1] = send n
+    awaiting_resend: bool = False   # queued or parked for a resend, timer stopped
+    early_resend_no: int = 0        # send number of a resend that RACK triggered
 
     @property
     def sends(self) -> int:
@@ -270,8 +293,14 @@ class MySender(Sender):
         self.probe: dict[str, int] = {}                  # dst -> probing msg_id
         self.parked = {dst: deque() for dst in self.order}   # held msg_ids
 
+        # Loss detection from ACKs (see REO_WND_MIN_S)
+        self.inflight = {dst: deque() for dst in self.order}   # (sent_at, msg_id)
+        self.reo_wnd = {dst: REO_WND_MIN_S for dst in self.order}
+
         self.data_sent = 0
         self.resent = 0
+        self.early_resends = 0
+        self.needless_resends = 0
         self.timeouts = 0
         self.acked = 0
         self.oversized = 0
@@ -304,11 +333,17 @@ class MySender(Sender):
         sent_at = entry.sent_at(pkt.send_no)   # the copy this ACK answers
         if sent_at is not None:
             self.rtt[entry.dst].update(self.now() - sent_at)
+        if 0 < pkt.send_no < entry.early_resend_no:
+            self._early_resend_was_needless(entry.dst)
         self._heard_from(entry.dst)
+        if sent_at is not None:
+            self._detect_losses(entry.dst, sent_at)
 
     def on_stop(self):
-        self.log("data_sent", self.data_sent, "resent", self.resent, "acked", self.acked,
-                 "unacked", len(self.outstanding), "oversized", self.oversized)
+        self.log("data_sent", self.data_sent, "resent", self.resent,
+                 "early", self.early_resends, "needless", self.needless_resends,
+                 "acked", self.acked, "unacked", len(self.outstanding),
+                 "oversized", self.oversized)
         for dst in self.order:
             est = self.rtt[dst]
             if est.srtt is not None:
@@ -374,6 +409,8 @@ class MySender(Sender):
         packet = encode_data(entry.msg_id, entry.payload, send_no=entry.sends + 1)
         self.send_datagram(packet, to=entry.dst)
         entry.send_times.append(now)
+        entry.awaiting_resend = False
+        self.inflight[entry.dst].append((now, entry.msg_id))
         self.data_sent += 1
         if entry.sends > 1:
             self.resent += 1
@@ -408,6 +445,7 @@ class MySender(Sender):
         if dst not in self.down and self.timeouts_in_row[dst] >= DOWN_AFTER_TIMEOUTS:
             self.down.add(dst)
             self.log("down", dst, "after", self.timeouts_in_row[dst], "timeouts")
+        entry.awaiting_resend = True
         if dst in self.down:
             probe = self.probe.get(dst)
             if probe is not None and probe != msg_id and probe in self.outstanding:
@@ -416,6 +454,29 @@ class MySender(Sender):
             self.probe[dst] = msg_id
         self.resend.append(msg_id)
         self._wake()
+
+    def _detect_losses(self, dst: str, acked_sent_at: float):
+        """Resend packets to dst sent a reordering window before an ACKed one."""
+        q = self.inflight[dst]
+        found = False
+        while q and q[0][0] + self.reo_wnd[dst] <= acked_sent_at:
+            sent_at, msg_id = q.popleft()
+            entry = self.outstanding.get(msg_id)
+            if entry is None or entry.awaiting_resend or entry.send_times[-1] != sent_at:
+                continue   # ACKed, already queued, or resent since this copy
+            self.cancel_timer(RTO_PREFIX + str(msg_id))
+            entry.awaiting_resend = True
+            entry.early_resend_no = entry.sends + 1
+            self.early_resends += 1
+            self.resend.append(msg_id)
+            found = True
+        if found:
+            self._wake()
+
+    def _early_resend_was_needless(self, dst: str):
+        """An earlier copy got through after all: the path reorders more."""
+        self.needless_resends += 1
+        self.reo_wnd[dst] = min(2 * self.reo_wnd[dst], REO_WND_MAX_S)
 
     def _heard_from(self, dst: str):
         """An ACK came back from dst: it is reachable, so release what was held."""

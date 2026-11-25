@@ -381,6 +381,85 @@ def test_stray_and_repeated_acks_are_ignored(tmp_path):
     assert s.acked == 1
 
 
+# ---- loss detection from ACKs (RACK) ---------------------------------------
+
+def send_at(sender, sim, msg_id, dst, t):
+    """Offer one message at time t and let the pacer send it."""
+    sim.t = t
+    sender.on_app_data(msg(msg_id, dst))
+    drain(sender, sim)
+
+
+def test_ack_for_a_later_packet_resends_an_earlier_one_at_once(tmp_path):
+    s, sim = make_sender(tmp_path)
+    send_at(s, sim, 0, "receiver4", 0.000)   # lost
+    send_at(s, sim, 1, "receiver4", 0.005)
+    ack(s, sim, 1, at=0.105)                 # message 1 got through...
+    drain(s, sim)                            # ...so 0 is resent now, not at its RTO
+    assert sent_ids(sim) == [0, 1, 0]
+    assert sim.send_times[-1] == pytest.approx(0.105)
+    assert P.decode(sim.sent[-1][0]).send_no == 2
+    assert s.early_resends == 1
+    assert "rto:0" in sim.timers             # re-armed for the new copy
+
+
+def test_packets_within_the_reordering_window_are_not_resent(tmp_path):
+    s, sim = make_sender(tmp_path)
+    send_at(s, sim, 0, "receiver4", 0.000)
+    send_at(s, sim, 1, "receiver4", P.REO_WND_MIN_S / 2)   # could just be reordered
+    ack(s, sim, 1, at=0.1)
+    drain(s, sim)
+    assert sent_ids(sim) == [0, 1]
+
+
+def test_an_ack_only_reveals_losses_to_its_own_destination(tmp_path):
+    s, sim = make_sender(tmp_path)
+    send_at(s, sim, 0, "receiver4", 0.000)
+    send_at(s, sim, 1, "receiver5", 0.005)   # another path
+    ack(s, sim, 1, at=0.105)
+    drain(s, sim)
+    assert sent_ids(sim) == [0, 1]
+
+
+def test_a_timed_out_packet_is_not_queued_twice(tmp_path):
+    s, sim = make_sender(tmp_path)
+    send_at(s, sim, 0, "receiver4", 0.000)
+    send_at(s, sim, 1, "receiver4", 0.005)
+    sim.t = P.RTO_INITIAL_S
+    del sim.timers["rto:0"]
+    s.on_timer("rto:0")                      # 0 timed out and waits to resend...
+    ack(s, sim, 1, at=P.RTO_INITIAL_S)       # ...when a later ACK also flags it
+    drain(s, sim)
+    assert sent_ids(sim) == [0, 1, 0]
+    assert s.early_resends == 0
+
+
+def test_a_needless_early_resend_widens_the_window(tmp_path):
+    s, sim = make_sender(tmp_path)
+    send_at(s, sim, 0, "receiver4", 0.000)
+    send_at(s, sim, 1, "receiver4", 0.005)
+    ack(s, sim, 1, at=0.105)
+    drain(s, sim)                            # 0 resent early as copy 2...
+    ack(s, sim, 0, at=0.106, send_no=1)      # ...but copy 1 was only reordered
+    assert s.needless_resends == 1
+    assert s.reo_wnd["receiver4"] == 2 * P.REO_WND_MIN_S
+    assert s.reo_wnd["receiver5"] == P.REO_WND_MIN_S
+
+
+def test_the_reordering_window_is_capped(tmp_path):
+    s, sim = make_sender(tmp_path)
+    t = 0.0
+    for mid in range(0, 40, 2):              # many needless early resends in a row
+        send_at(s, sim, mid, "receiver4", t)
+        send_at(s, sim, mid + 1, "receiver4", t + 0.05)
+        ack(s, sim, mid + 1, at=t + 0.15)
+        drain(s, sim)
+        ack(s, sim, mid, at=t + 0.151, send_no=1)
+        t += 1.0
+    assert s.reo_wnd["receiver4"] == P.REO_WND_MAX_S
+    assert P.REO_WND_MAX_S <= P.RTO_MARGIN_S   # never waits longer than the RTO margin
+
+
 # ---- down destinations -----------------------------------------------------
 
 def send_and_lose(sender, sim, ids, dst):
